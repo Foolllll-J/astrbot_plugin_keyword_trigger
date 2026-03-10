@@ -83,9 +83,38 @@ class KeywordTriggerPlugin(Star):
                 
         return True
 
+    def _get_wake_prefixes(self, event: AstrMessageEvent) -> list:
+        try:
+            cfg = self.context.get_config(event.unified_msg_origin)
+        except Exception:
+            cfg = self.context.get_config()
+        wake_prefixes = cfg.get("wake_prefix", [])
+        if isinstance(wake_prefixes, str):
+            wake_prefixes = [wake_prefixes]
+        return [p for p in wake_prefixes if isinstance(p, str) and p]
+
     @filter.event_message_type(filter.EventMessageType.ALL)  
     async def on_message(self, event: AstrMessageEvent):
         """监听所有消息，匹配关键词后派发新的命令事件"""
+        # 跳过由本插件创建的事件
+        try:
+            if event.get_extra("keyword_trigger_origin", False):
+                return
+        except Exception:
+            pass
+        # 跳过本插件创建的内部命令事件，避免循环
+        msg_id = getattr(getattr(event, "message_obj", None), "message_id", "")
+        if isinstance(msg_id, str) and msg_id.startswith("command_trigger_"):
+            return
+
+        # 跳过已包含命令前缀的消息（原始 message_str 保留前缀）
+        wake_prefixes = self._get_wake_prefixes(event)
+        raw_msg_str = getattr(getattr(event, "message_obj", None), "message_str", "")
+        if isinstance(raw_msg_str, str):
+            for prefix in wake_prefixes:
+                if raw_msg_str.startswith(prefix):
+                    return
+
         # 检查事件是否已经是指令（避免重复触发）
         if hasattr(event, 'is_at_or_wake_command') and event.is_at_or_wake_command:
             logger.debug(f"[关键词触发] 跳过已识别为指令的事件: {event.message_str}")
@@ -97,9 +126,20 @@ class KeywordTriggerPlugin(Star):
             return
         
         # 跳过已经带命令前缀的消息
-        if text.startswith("/") or text.startswith("#"):
+        if any(text.startswith(prefix) for prefix in wake_prefixes):
             logger.debug(f"[关键词触发] 跳过命令格式消息: '{text}'")
             return
+
+        # 如果已 @ 机器人或回复机器人，交给正常唤醒流程处理，避免重复触发
+        try:
+            self_id = str(event.get_self_id())
+            for comp in event.get_messages() or []:
+                if isinstance(comp, At) and str(comp.qq) == self_id:
+                    return
+                if hasattr(comp, "sender_id") and str(getattr(comp, "sender_id", "")) == self_id:
+                    return
+        except Exception:
+            pass
         
         # 检查是否仅限群聊
         if self.group_only:
@@ -117,7 +157,8 @@ class KeywordTriggerPlugin(Star):
         if matched_keyword:
             # 获取关键词后面的内容（参数部分）
             suffix = text[len(matched_keyword):]
-            new_command = f"/{matched_keyword}{suffix}"
+            command_prefix = wake_prefixes[0] if wake_prefixes else "/"
+            new_command = f"{command_prefix}{matched_keyword}{suffix}"
             
             # 提取原始消息中的非文本组件（如 At 组件）
             original_components = self._extract_non_text_components(event)
@@ -147,6 +188,10 @@ class KeywordTriggerPlugin(Star):
                     original_components=original_components,
                     is_admin=is_admin
                 )
+                try:
+                    new_event.set_extra("keyword_trigger_origin", True)
+                except Exception:
+                    pass
                 
                 # 将新事件放入事件队列
                 self.context.get_event_queue().put_nowait(new_event)
